@@ -5,6 +5,7 @@ const runButton = document.querySelector("#run-button");
 const savedFields = ["owner", "repo", "workflow", "workbook_path", "username"];
 const branch = "main";
 const pollDelayMs = 15000;
+const runLookupDelayMs = 5000;
 
 for (const field of savedFields) {
   const value = localStorage.getItem(`myrt:${field}`);
@@ -55,20 +56,29 @@ async function githubFetch(url, token, options = {}) {
   return response;
 }
 
-async function findStartedRun(data, token, startedAt) {
+function workflowRunsUrl(data) {
   const encodedWorkflow = encodeURIComponent(data.workflow);
-  const runsUrl = `https://api.github.com/repos/${encodeURIComponent(data.owner)}/${encodeURIComponent(data.repo)}/actions/workflows/${encodedWorkflow}/runs?branch=${branch}&event=workflow_dispatch&per_page=10`;
+  return `https://api.github.com/repos/${encodeURIComponent(data.owner)}/${encodeURIComponent(data.repo)}/actions/workflows/${encodedWorkflow}/runs?branch=${branch}&event=workflow_dispatch&per_page=10`;
+}
 
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    const response = await githubFetch(runsUrl, token);
-    const payload = await response.json();
-    const run = payload.workflow_runs.find((candidate) => new Date(candidate.created_at) >= startedAt);
+async function getLatestWorkflowRun(data, token) {
+  const response = await githubFetch(workflowRunsUrl(data), token);
+  const payload = await response.json();
+  return payload.workflow_runs[0] || null;
+}
 
-    if (run) return run;
-    await sleep(5000);
+async function findStartedRun(data, token, previousRunId) {
+  const actionsUrl = `https://github.com/${data.owner}/${data.repo}/actions/workflows/${data.workflow}`;
+
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    const latest = await getLatestWorkflowRun(data, token);
+
+    if (latest && latest.id !== previousRunId) return latest;
+    setStatus(`Workflow started. Waiting for GitHub to publish the run...`, "pending");
+    await sleep(runLookupDelayMs);
   }
 
-  throw new Error("The workflow started, but GitHub did not return the run yet. Open the Actions page and refresh this page if needed.");
+  throw new Error(`The workflow started, but GitHub did not return the new run yet. Open ${actionsUrl} to watch it.`);
 }
 
 async function waitForRun(data, token, run) {
@@ -115,17 +125,20 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = Object.fromEntries(new FormData(form).entries());
   const token = data.token;
-  const startedAt = new Date(Date.now() - 10000);
 
   for (const field of savedFields) {
     localStorage.setItem(`myrt:${field}`, data[field]);
   }
 
   runButton.disabled = true;
-  setStatus("Starting GitHub Actions workflow...");
+  setStatus("Checking the latest GitHub Actions run...");
   document.querySelector("#token").value = "";
 
   try {
+    const previousRun = await getLatestWorkflowRun(data, token);
+    const previousRunId = previousRun ? previousRun.id : null;
+
+    setStatus("Starting GitHub Actions workflow...");
     await githubFetch(
       `https://api.github.com/repos/${encodeURIComponent(data.owner)}/${encodeURIComponent(data.repo)}/actions/workflows/${encodeURIComponent(data.workflow)}/dispatches`,
       token,
@@ -147,7 +160,7 @@ form.addEventListener("submit", async (event) => {
     );
 
     setStatus("Workflow started. Finding the run on GitHub...");
-    const run = await findStartedRun(data, token, startedAt);
+    const run = await findStartedRun(data, token, previousRunId);
     await waitForRun(data, token, run);
 
     setStatus("Workflow complete. Preparing the download...");
